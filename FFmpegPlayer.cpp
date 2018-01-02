@@ -544,6 +544,7 @@ int read_thread(void * arg) {
     int video_stream = -1;
     int audio_stream = -1;
     int ret = 0;
+    int eof = 0;
 
     is->abort_request = 0;
     is->audio_stream = -1;
@@ -607,19 +608,32 @@ int read_thread(void * arg) {
     for(;;) {
         if(is->abort_request)
             break;
+        
+        if(eof) {
+            //play end
+            if(is->audioq.size + is->videoq.size == 0) {
+                cout<<"play eof!"<<endl;
+                ret = AVERROR_EOF;
+                goto fail;
+            }
+
+            eof = 0;
+            continue;
+        }
 
         if((ret = av_read_frame(pFormatCtx, pkt)) < 0) {
             if(ret == AVERROR_EOF) {
-                cout<<"av_read_frame:eof"<<endl;
-                break;
+                eof = 1;
             }
 
             if(pFormatCtx->pb && pFormatCtx->pb->error)
                 break;
-            else {
-                SDL_Delay(10);
-                continue;
-            }
+
+            SDL_Delay(10);
+            continue;
+        }
+        else {
+            eof = 0;
         }
 
         if(pkt->stream_index == is->audio_stream) {
