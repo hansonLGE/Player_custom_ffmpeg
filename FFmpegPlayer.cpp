@@ -54,6 +54,11 @@ typedef struct _PacketQueue {
 } PacketQueue;
 
 typedef struct _VideoState {
+    int seek_req;
+    int seek_flags;
+    int seek_pos;
+    int seek_rel;
+
     AVFormatContext *ic;
     int video_stream;
     int audio_stream;
@@ -113,6 +118,7 @@ static unsigned sws_flags = SWS_BICUBIC;
 
 void frame_queue_destroy(FrameQueue *f);
 int packet_queue_init(PacketQueue *q);
+void packet_queue_flush(PacketQueue *q);
 void packet_queue_start(PacketQueue *q);
 int packet_queue_put(PacketQueue *q, AVPacket *pkt);
 int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block);
@@ -145,6 +151,8 @@ static int default_width  = 640;
 static int default_height = 480;
 static SDL_Window *window;
 static SDL_Renderer *renderer;
+
+AVPacket flush_pkt;
 
 void stream_component_close(VideoState *is, int stream_index) {
     AVFormatContext *ic = is->ic;
@@ -255,6 +263,13 @@ int video_decode_frame(VideoState *is, AVFrame *frame) {
         return -1;
     }
 
+    //flush codec
+    if(pkt->data == flush_pkt.data) {
+        cout<<"[video] codec flush"<<endl;
+        avcodec_flush_buffers(avctx);
+        return 0;
+    }
+
     //decode video frame
     if(avcodec_send_packet(avctx, pkt) == AVERROR(EAGAIN) ) {
         cout<<"[video] could not send the packet to decoder! error:"<<AVERROR(EAGAIN)<<endl;
@@ -349,6 +364,10 @@ void frame_queue_next(FrameQueue *f) {
     f->size--;
     SDL_CondSignal(f->cond);
     SDL_UnlockMutex(f->mutex);
+}
+
+int frame_queue_nb_remaining(FrameQueue *f) {
+    return f->size - f->rindex_shown;
 }
 
 VideoPicture *frame_queue_peek(FrameQueue *f) {
@@ -608,7 +627,32 @@ int read_thread(void * arg) {
     for(;;) {
         if(is->abort_request)
             break;
-        
+
+        if(is->seek_req) {
+            int64_t seek_target = is->seek_pos;
+            int64_t seek_min    = is->seek_rel > 0 ? seek_target - is->seek_rel + 2: INT64_MIN;
+            int64_t seek_max    = is->seek_rel < 0 ? seek_target - is->seek_rel - 2: INT64_MAX;
+
+            ret = avformat_seek_file(is->ic, -1, seek_min, seek_target, seek_max, is->seek_flags);
+            if(ret <0) {
+                cout<<"error while seeking"<<endl;
+            }
+            else {
+                if(is->audio_stream >= 0) {
+                    packet_queue_flush(&is->audioq);
+                    packet_queue_put(&is->audioq, &flush_pkt);
+                }
+
+                if(is->video_stream >= 0) {
+                    packet_queue_flush(&is->videoq);
+                    packet_queue_put(&is->videoq, &flush_pkt);
+                }
+            }
+
+            is->seek_req = 0;
+            eof = 0;
+        }
+
         if(eof) {
             //play end
             if(is->audioq.size + is->videoq.size == 0) {
@@ -773,6 +817,7 @@ int upload_texture(SDL_Texture **tex, AVFrame *frame, struct SwsContext **img_co
     case SDL_PIXELFORMAT_IYUV:
         SDL_UpdateYUVTexture(*tex, NULL, frame->data[0], frame->linesize[0], frame->data[1], frame->linesize[1], 
                              frame->data[2], frame->linesize[2]);
+            
         break;
     default:
         SDL_UpdateTexture(*tex, NULL, frame->data[0], frame->linesize[0]);
@@ -843,34 +888,40 @@ void video_refresh(void *arg, double *remaining_time) {
     VideoState *is = (VideoState *)arg;
 
     if(is->video_st) {
-        double last_duration, delay;
-        double time;
-        VideoPicture *vp, *lastvp;
-
-        /* dequeue the picture */
-        lastvp = frame_queue_peek_last(&is->pictq);
-        vp = frame_queue_peek(&is->pictq);
-
-        last_duration = vp->pts - lastvp->pts;
-        if(last_duration <= 0 || last_duration >= 1.0)
-            last_duration = lastvp->pts;
-
-        delay = compute_target_delay(last_duration, is, vp->pts);
-        
-        time= av_gettime_relative()/1000000.0;
-        if (time < is->frame_timer + delay) {
-            *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
-            goto display;
+        if (frame_queue_nb_remaining(&is->pictq) == 0) {
+            // nothing to do, no picture to display in the queue
         }
-        
-        is->frame_timer += delay;
-        if (delay > 0 && time - is->frame_timer > AV_SYNC_THRESHOLD_MAX)
-            is->frame_timer = time;
+        else {
+            double last_duration, delay;
+            double time;
+            VideoPicture *vp, *lastvp;
 
-        frame_queue_next(&is->pictq);
+            //dequeue the picture
+            lastvp = frame_queue_peek_last(&is->pictq);
+            vp = frame_queue_peek(&is->pictq);
+
+            last_duration = vp->pts - lastvp->pts;
+           if(last_duration <= 0 || last_duration >= 1.0)
+                last_duration = lastvp->pts;
+
+            delay = compute_target_delay(last_duration, is, vp->pts);
+        
+            time= av_gettime_relative()/1000000.0;
+            if (time < is->frame_timer + delay) {
+                *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
+                goto display;
+            }
+        
+            is->frame_timer += delay;
+            if (delay > 0 && time - is->frame_timer > AV_SYNC_THRESHOLD_MAX)
+                is->frame_timer = time;
+
+            frame_queue_next(&is->pictq);
 
 display:
-        video_diaplay(is);    
+            if(is->pictq.rindex_shown)
+                video_diaplay(is); 
+        }    
     }
 
 }
@@ -890,8 +941,19 @@ void refresh_loop_wait_event(VideoState* is, SDL_Event *event) {
     }
 }
 
+void stream_seek(VideoState* is, int64_t pos, int rel) {
+    if(!is->seek_req) {
+        is->seek_pos = pos;
+        is->seek_rel = rel;
+        is->seek_flags &= ~AVSEEK_FLAG_BYTE;
+
+        is->seek_req = 1;
+    }
+}
+
 void event_loop(VideoState *is) {
     SDL_Event event;
+    double incr, pos;
 
     for(;;) {
         refresh_loop_wait_event(is, &event);
@@ -900,7 +962,30 @@ void event_loop(VideoState *is) {
             cout<<"do exit"<<endl;
             do_exit(is);
             break;
-        
+        case SDL_KEYDOWN:
+            switch (event.key.keysym.sym) {
+            case SDLK_LEFT:
+                cout<<"left"<<endl;
+                incr = -2.0;
+                goto do_seek;
+            case SDLK_RIGHT:
+                cout<<"right"<<endl;
+                incr = 2.0;
+                goto do_seek;
+            case SDLK_UP:
+                incr = 60.0;
+                goto do_seek;
+            case SDLK_DOWN:
+                incr = -60.0;
+            do_seek:
+                pos = get_audio_clock(is);
+                pos += incr;
+                stream_seek(is, (int64_t)(pos * AV_TIME_BASE), (int64_t)(incr * AV_TIME_BASE));
+                break;
+            default:
+                break;          
+            }
+            break;        
         default:
             break;
         }
@@ -917,6 +1002,9 @@ int main(int argc, char** argv) {
         cout<<"could not initialize SDL - "<< SDL_GetError()<<endl;
         return -1;
     }
+
+    av_init_packet(&flush_pkt);
+    flush_pkt.data = (uint8_t *)&flush_pkt;
 
     is = (VideoState *)av_mallocz(sizeof(VideoState));
     if(!is)
@@ -1163,6 +1251,13 @@ int audio_decode_frame(VideoState *is, uint8_t *audio_buf, int buf_size, double 
         return -1;
     }
 
+    //flush codec
+    if(pkt->data == flush_pkt.data) {
+        cout<<"[audio] codec flush"<<endl;
+        avcodec_flush_buffers(avctx);
+        return 0;
+    }
+
     //if update, update the audio clock with pts
     if(pkt->pts != AV_NOPTS_VALUE) {
         is->audio_clock = av_q2d(is->audio_st->time_base) * pkt->pts;
@@ -1271,6 +1366,25 @@ int packet_queue_init(PacketQueue *q) {
     return 0;
 }
 
+void packet_queue_flush(PacketQueue *q) {
+    AVPacketList *pkt, *pktl;
+   
+    SDL_LockMutex(q->mutex);
+    for(pkt = q->first_pkt; pkt != NULL; pkt = pktl) {
+        pktl = pkt->next;
+        av_packet_unref(&pkt->pkt);
+        av_freep(&pkt);
+    }
+
+    cout<<endl;
+    q->last_pkt = NULL;
+    q->first_pkt = NULL;
+    q->nb_packets = 0;
+    q->size = 0;
+ 
+    SDL_UnlockMutex(q->mutex);
+}
+
 void packet_queue_start(PacketQueue *q) {
     SDL_LockMutex(q->mutex);
     q->abort_request = 0;
@@ -1279,20 +1393,22 @@ void packet_queue_start(PacketQueue *q) {
 
 int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
     AVPacketList *pktl;
-   /* AVPacket copy = {0};
+    AVPacket copy = {0};
     
-    if(av_packet_ref(&copy, pkt) < 0) {
+    if(pkt != &flush_pkt && av_packet_ref(&copy, pkt) < 0) {
         return -1;
     }
-   */
+
     SDL_LockMutex(q->mutex);
 
-    if(q->abort_request)
+    if(q->abort_request) {
         return -1;
+    }
 
     pktl = (AVPacketList *)av_malloc(sizeof(AVPacketList));
-    if(!pktl)
+    if(!pktl) {
         return -1;
+    }
 
     pktl->pkt = *pkt;
     pktl->next = NULL;
