@@ -576,6 +576,11 @@ int read_thread(void * arg) {
     }
 
     //open file
+    // TODO : seems to be broken on Windows, because using std::wstring.
+    // works perfectly on Linux : rtsp, filenames, and so on
+    // Tested on Linux + wine64 : .exe work well using const char * (needs some cast tricks though)
+    // does NOT work (as usual) on Windows
+    // C:\one_path\filename.ext  becomes  C:~   followed by garbage
     if(avformat_open_input(&pFormatCtx, is->filename, NULL, NULL) < 0) {
         ret = -1;
         goto fail;
